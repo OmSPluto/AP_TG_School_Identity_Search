@@ -1,6 +1,10 @@
-import streamlit as st
-import pandas as pd
+import json
+import sqlite3
 from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+
 from search_engine import FastSchoolIndex
 
 st.set_page_config(
@@ -9,41 +13,62 @@ st.set_page_config(
     layout="wide",
 )
 
-BASE = Path(__file__).parent
+BASE = Path(__file__).resolve().parent
 DATA = BASE / "data"
-XLSX = DATA / "SMS_Schools_Consolidated_Cohort_2026_01_Oct.xlsx"
 DB = DATA / "school_search.sqlite"
 ENRICHMENT = DATA / "verified_school_enrichment.csv"
 HISTORY = DATA / "district_history.csv"
 
 
-@st.cache_data(show_spinner=False)
-def metadata():
-    header = pd.read_excel(XLSX, nrows=0, engine="openpyxl")
-    cols = list(header.columns)
+def clean(value):
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text.lower() in {"nan", "none", "nat"}:
+        return ""
+    return text
 
-    def find_col(*terms):
-        for col in cols:
-            low = col.lower()
-            if any(term in low for term in terms):
-                return col
+
+# -----------------------------------------------------------------------------
+# Load the schema from the already-built SQLite search index.
+# This avoids reading the Excel workbook during every Streamlit startup.
+# -----------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def load_schema():
+    if not DB.exists():
+        raise FileNotFoundError(f"Search database not found: {DB}")
+
+    with sqlite3.connect(DB) as conn:
+        row = conn.execute("SELECT data_json FROM schools LIMIT 1").fetchone()
+
+    if not row:
+        raise RuntimeError("The SQLite school database contains no school records.")
+
+    record = json.loads(row[0])
+    columns = list(record.keys())
+
+    def find_col(*names):
+        lower = {c.lower(): c for c in columns}
+        for name in names:
+            if name.lower() in lower:
+                return lower[name.lower()]
         return None
 
-    return cols, {
-        "state": find_col("school_state", "state"),
-        "district": find_col("school_district", "district"),
-        "block": find_col("school_block", "mandal", "block"),
-        "village": find_col("school_village", "village"),
-        "school_name": find_col("school_name", "schoolname"),
-        "updated_name": find_col("updated_school_name", "updated"),
-        "udise": find_col("udise", "emis", "school_code"),
+    return columns, {
+        "state": find_col("School_State__c"),
+        "district": find_col("School_District__c"),
+        "block": find_col("School_Block__c"),
+        "village": find_col("School_Village__c"),
+        "school_name": find_col("School_Name__c"),
+        "updated_name": find_col("Updated_School_Name_c"),
+        "udise": find_col("School_Udise_Code__c"),
     }
 
 
 @st.cache_resource(show_spinner=False)
 def get_index():
-    cols, sem = metadata()
-    return FastSchoolIndex(DB, cols, sem, ENRICHMENT)
+    columns, semantic = load_schema()
+    return FastSchoolIndex(DB, columns, semantic, ENRICHMENT)
 
 
 @st.cache_data(show_spinner=False)
@@ -60,37 +85,12 @@ def load_enrichment():
     return pd.read_csv(ENRICHMENT, dtype=str).fillna("")
 
 
-cols, sem = metadata()
-idx = get_index()
-hist = load_history()
-
-
-def clean(value):
-    if value is None:
-        return ""
-    text = str(value).strip()
-    if text.lower() in {"nan", "none", "nat"}:
-        return ""
-    return text
-
-
-def get_value(record, key):
-    if not key:
-        return ""
-    return clean(record.get(key, ""))
-
-
-def get_school_name(record):
-    return (
-        get_value(record, sem["updated_name"])
-        or get_value(record, sem["school_name"])
-        or "School"
-    )
-
-
-def merge_enrichment(record):
-    """Add externally verified fields when a UDISE match exists."""
-    output = dict(record)
-    enrichment = load_enrichment()
-
-    udise_col = sem.get("udise")
+# Show a useful error instead of an all-white page if startup data is broken.
+try:
+    cols, sem = load_schema()
+    idx = get_index()
+    hist = load_history()
+except Exception as exc:
+    st.error("The app could not load its school search data.")
+    st.code(str(exc))
+    st.info(
