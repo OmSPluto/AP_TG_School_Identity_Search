@@ -1,195 +1,3 @@
-
-import streamlit as st
-import pandas as pd
-from pathlib import Path
-from search_engine import FastSchoolIndex
-
-st.set_page_config(
-    page_title="AP & Telangana School Identity Search",
-    page_icon="🏫",
-    layout="wide"
-)
-
-BASE = Path(__file__).parent
-DATA = BASE / "data"
-XLSX = DATA / "SMS_Schools_Consolidated_Cohort_2026_01_Oct.xlsx"
-DB = DATA / "school_search.sqlite"
-
-@st.cache_data(show_spinner=False)
-def metadata():
-    d = pd.read_excel(XLSX, nrows=0, engine="openpyxl")
-    cols = list(d.columns)
-
-    def p(*terms):
-        for c in cols:
-            if any(t in c.lower() for t in terms):
-                return c
-
-    return cols, {
-        "state": p("school_state", "state"),
-        "district": p("school_district", "district"),
-        "block": p("school_block", "mandal", "block"),
-        "village": p("school_village", "village"),
-        "school_name": p("school_name", "schoolname"),
-        "updated_name": p("updated_school_name", "updated"),
-        "udise": p("udise", "emis", "school_code"),
-    }
-
-@st.cache_resource(show_spinner=False)
-def get_index():
-    cols, sem = metadata()
-    return FastSchoolIndex(DB, cols, sem, DATA / "verified_school_enrichment.csv")
-
-@st.cache_data(show_spinner=False)
-def history():
-    return pd.read_csv(DATA / "district_history.csv")
-
-@st.cache_data(show_spinner=False)
-def enrichment():
-    p = DATA / "verified_school_enrichment.csv"
-    if not p.exists():
-        return pd.DataFrame()
-    return pd.read_csv(p, dtype=str).fillna("")
-
-def merge_enrichment(record):
-    e = enrichment()
-    if e.empty or not sem["udise"]:
-        return record
-    code = str(record.get(sem["udise"], "")).strip()
-    if not code:
-        return record
-    matches = e[e["udise_code"].astype(str).str.strip() == code]
-    if matches.empty:
-        return record
-    extra = matches.iloc[0].to_dict()
-    mapping = {
-        "verified_school_name": "Verified School Name",
-        "school_category": "School Category",
-        "school_management": "School Management",
-        "class_range": "Class",
-        "school_type": "School Type",
-        "school_location": "School Location",
-        "lgd_block": "LGD Block",
-        "lgd_panchayat": "LGD Panchayat",
-        "lgd_village": "LGD Village",
-        "address": "Verified Address",
-        "pin_code": "PIN Code",
-        "source": "Verification Source",
-        "source_url": "Verification Source URL",
-        "source_year": "Source Year",
-        "verification_status": "Verification Status",
-        "last_verified": "Last Verified",
-    }
-    for k, label in mapping.items():
-        if str(extra.get(k, "")).strip():
-            record[label] = extra[k]
-    return record
-
-cols, sem = metadata()
-idx = get_index()
-hist = history()
-
-st.markdown("""
-<style>
-.block-container {max-width:1280px;padding-top:1.2rem}
-.result {border:1px solid #e5e7eb;border-radius:12px;padding:14px;margin:8px 0}
-.muted {color:#8a93a3;font-size:.88rem}
-.profile {border:1px solid #e5e7eb;border-radius:14px;padding:18px;margin-top:12px}
-</style>
-""", unsafe_allow_html=True)
-
-st.title("🏫 AP & Telangana School Identity Search")
-st.caption("Select State first. District and Village are optional filters. Results show the top 3 matches.")
-
-# Wide search area + wide reference area
-left, right = st.columns([2.15, 1.65], gap="large")
-
-with left:
-    st.subheader("Find Your School")
-
-    indexed = {str(x).strip().casefold(): str(x).strip() for x in idx.states()}
-    display_states = ["Andhra Pradesh", "Telangana"]
-    available = [x for x in display_states if x.casefold() in indexed]
-
-    state = st.selectbox(
-        "1. State *",
-        ["Select State"] + available,
-        key="state_filter"
-    )
-
-    if state == "Select State":
-        st.selectbox("2. District", ["Select State first"], disabled=True)
-        st.selectbox("3. Village", ["Select District first"], disabled=True)
-        with st.form("search_form"):
-            q = st.text_input(
-                "4. Search",
-                placeholder="School name, short name, UDISE code, etc.",
-                disabled=True
-            )
-            go = st.form_submit_button("SEARCH", disabled=True, use_container_width=True)
-        st.info("State is mandatory. Select Andhra Pradesh or Telangana to continue.")
-    else:
-        state_db = indexed[state.casefold()]
-
-        districts = idx.districts(state_db)
-        district = st.selectbox(
-            "2. District",
-            ["All Districts"] + districts,
-            key=f"district_{state_db}"
-        )
-
-        if district == "All Districts":
-            villages = []
-            village = st.selectbox(
-                "3. Village",
-                ["Select District first"],
-                disabled=True,
-                key=f"village_disabled_{state_db}"
-            )
-            village_db = ""
-        else:
-            villages = idx.villages(state_db, district)
-            village = st.selectbox(
-                "3. Village",
-                ["All Villages"] + villages,
-                key=f"village_{state_db}_{district}"
-            )
-            village_db = "" if village == "All Villages" else village
-
-        with st.form("search_form"):
-            q = st.text_input(
-                "4. Search",
-                placeholder="School name, short name, UDISE code, etc."
-            )
-            go = st.form_submit_button(
-                "SEARCH",
-                type="primary",
-                use_container_width=True
-            )
-
-        with st.expander("Advanced Search"):
-            st.caption("More filters can be added here later without changing the fast indexed search.")
-
-        if go:
-            results = idx.search(
-                q,
-                state_db,
-                district if district != "All Districts" else "",
-                village_db,
-                limit=3
-            )
-            st.session_state["results"] = results
-            st.session_state["selected_school"] = None
-
-        results = st.session_state.get("results")
-
-        if results is not None:
-            st.subheader("Top 3 Results")
-
-            if not results:
-                st.info("No matching school found.")
-
-            for i, r in enumerate(results, 1):
                 name = (
                     r.get(sem["updated_name"], "")
                     or r.get(sem["school_name"], "")
@@ -218,14 +26,20 @@ with left:
 
                 if st.button(
                     "View full school details →",
-                    key=f"view_{i}",
+                    key=f"view_{ud or i}",
                     use_container_width=True
                 ):
                     st.session_state["selected_school"] = merge_enrichment(r)
+                    st.session_state["selected_school_udise"] = str(ud or "")
+                    st.rerun()
 
         selected = st.session_state.get("selected_school")
 
         if selected:
+            if st.button("← Back to search results", key="back_to_results"):
+                st.session_state["selected_school"] = None
+                st.session_state["selected_school_udise"] = None
+                st.rerun()
             st.divider()
             st.subheader("School Profile")
 
