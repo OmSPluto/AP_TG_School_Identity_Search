@@ -93,4 +93,4 @@ try:
 except Exception as exc:
     st.error("The app could not load its school search data.")
     st.code(str(exc))
-    st.info(
+    st.info()
